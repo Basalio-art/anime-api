@@ -41,10 +41,14 @@ const (
     source
     countryOfOrigin
     isAdult
-    studios(isMain: true) { nodes { name isAnimationStudio } }
+    studios { edges { isMain node { name isAnimationStudio } } }
     nextAiringEpisode { episode airingAt timeUntilAiring }
     startDate { year month day }
     endDate { year month day }
+    description(asHtml: false)
+    tags { name isGeneralSpoiler isAdult}
+    externalLinks { url site type }
+    trailer { id site thumbnail }
 `
 	MediaFullFields = `
     id
@@ -185,8 +189,8 @@ func main() {
 	r.GET("/sources", getSourcesRoute)
 	r.GET("/watch/:provider/:anilist_id/:category/:slug", getWatchSources)
 
-	log.Println("Server running on http://0.0.0.0:8000")
-	if err := r.Run("0.0.0.0:8000"); err != nil {
+	log.Println("Server running on http://localhost:9189")
+	if err := r.Run("0.0.0.0:9189"); err != nil {
 		log.Fatal(err)
 	}
 }
