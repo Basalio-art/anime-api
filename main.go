@@ -164,7 +164,10 @@ func main() {
 
 	// CORS Middleware
 	r.Use(cors.New(cors.Config{
-		AllowAllOrigins:  true,
+		AllowAllOrigins:   []string{
+        "http://localhost:5173",     
+        "http://zenith.app",
+    },
 		AllowMethods:     []string{"*"},
 		AllowHeaders:     []string{"*"},
 		AllowCredentials: true,
