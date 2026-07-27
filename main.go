@@ -19,7 +19,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const CURRENT_VERSION = "1.1.5"
+const CURRENT_VERSION = "1.3.6"
 
 const (
 	AnilistUrl     = "https://graphql.anilist.co"
