@@ -19,6 +19,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
+const CURRENT_VERSION = "1.1.0"
+
 const (
 	AnilistUrl     = "https://graphql.anilist.co"
 	MiruroPipeUrl  = "https://www.miruro.tv/api/secure/pipe"
@@ -174,6 +176,13 @@ func main() {
 	}))
 
 	// Routes
+  r.HEAD("/", func(c *gin.Context) {
+    c.Status(http.StatusOK)
+  })
+
+  r.GET("/version", func(c *gin.Context) {
+    c.JSON(http.StatusOK, gin.H{"version": CURRENT_VERSION})
+  })
 	r.GET("/", home)
 	r.GET("/search", searchAnime)
 	r.GET("/suggestions", searchSuggestions)
@@ -193,7 +202,7 @@ func main() {
 	r.GET("/watch/:provider/:anilist_id/:category/:slug", getWatchSources)
 
 	log.Println("Server running on http://localhost:9189")
-	if err := r.Run("0.0.0.0:9189"); err != nil {
+	if err := r.Run("localhost:9189"); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -588,7 +597,7 @@ func searchAnime(c *gin.Context) {
     query ($search: String, $page: Int, $perPage: Int) {
         Page(page: $page, perPage: $perPage) {
             pageInfo { total currentPage lastPage hasNextPage perPage }
-            media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+            media(search: $search, type: ANIME, sort: SEARCH_MATCH, isAdult: false) {
                 %s
             }
         }
@@ -622,7 +631,7 @@ func searchSuggestions(c *gin.Context) {
 	gql := `
     query ($search: String) {
         Page(page: 1, perPage: 8) {
-            media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+            media(search: $search, type: ANIME, sort: SEARCH_MATCH, isAdult: false) {
                 id
                 title { romaji english }
                 coverImage { large }
@@ -727,7 +736,7 @@ func filterAnime(c *gin.Context) {
     query (%s) {
         Page(page: $page, perPage: $perPage) {
             pageInfo { total currentPage lastPage hasNextPage perPage }
-            media(%s) {
+            media(%s, isAdult: false) {
                 %s
             }
         }
@@ -755,7 +764,7 @@ func getSpotlight(c *gin.Context) {
 	gql := fmt.Sprintf(`
     query {
         Page(page: 1, perPage: 10) {
-            media(sort: [TRENDING_DESC, POPULARITY_DESC], type: ANIME) {
+            media(sort: [TRENDING_DESC, POPULARITY_DESC], type: ANIME, isAdult: false) {
                 %s
             }
         }
