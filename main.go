@@ -47,7 +47,7 @@ const (
     nextAiringEpisode { episode airingAt timeUntilAiring }
     startDate { year month day }
     endDate { year month day }
-    description(asHtml: false)
+    description
     tags { name isGeneralSpoiler isAdult}
     externalLinks { url site type }
     trailer { id site thumbnail }
