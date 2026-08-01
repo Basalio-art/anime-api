@@ -386,7 +386,7 @@ func fetchCollection(sortType string, status string, page int, perPage int) (map
     query ($page: Int, $perPage: Int) {
         Page(page: $page, perPage: $perPage) {
             pageInfo { total currentPage lastPage hasNextPage perPage }
-            media(type: ANIME, sort: [%s]%s) {
+            media(type: ANIME, sort: [%s]%s, isAdult: false) {
                 %s
             }
         }
