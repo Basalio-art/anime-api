@@ -9,6 +9,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+  "net/http/httputil"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,11 +22,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const CURRENT_VERSION = "1.3.6"
+const CURRENT_VERSION = "3.0.1"
 
 const (
-	AnilistUrl     = "https://graphql.anilist.co"
-	MiruroPipeUrl  = "https://www.miruro.tv/api/secure/pipe"
+	AnilistUrl      = "https://graphql.anilist.co"
+	MiruroPipeUrl   = "https://www.miruro.tv/api/secure/pipe"
 	MediaListFields = `
     id
     title { romaji english native }
@@ -166,23 +169,23 @@ func main() {
 
 	// CORS Middleware
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:   []string{
-        "http://localhost:5173",     
-        "http://zenith.app",
-    },
+		AllowOrigins: []string{
+			"http://localhost:5173",
+			"http://zenith.app",
+		},
 		AllowMethods:     []string{"*"},
 		AllowHeaders:     []string{"*"},
 		AllowCredentials: true,
 	}))
 
 	// Routes
-  r.HEAD("/", func(c *gin.Context) {
-    c.Status(http.StatusOK)
-  })
+	r.HEAD("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
 
-  r.GET("/version", func(c *gin.Context) {
-    c.JSON(http.StatusOK, gin.H{"version": CURRENT_VERSION})
-  })
+	r.GET("/version", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"version": CURRENT_VERSION})
+	})
 	r.GET("/", home)
 	r.GET("/search", searchAnime)
 	r.GET("/suggestions", searchSuggestions)
@@ -200,6 +203,7 @@ func main() {
 	r.GET("/episodes/:anilist_id", getEpisodesRoute)
 	r.GET("/sources", getSourcesRoute)
 	r.GET("/watch/:provider/:anilist_id/:category/:slug", getWatchSources)
+	r.GET("/proxy/stream", proxyStream)
 
 	log.Println("Server running on http://localhost:9189")
 	if err := r.Run("localhost:9189"); err != nil {
@@ -409,7 +413,6 @@ func fetchCollection(sortType string, status string, page int, perPage int) (map
 	}, nil
 }
 
-// Safely extracts typed values from untyped maps
 func getMapInt(m map[string]any, key string, def int) int {
 	if m == nil {
 		return def
@@ -432,157 +435,236 @@ func getMapBool(m map[string]any, key string) bool {
 
 // --- Handlers ---
 
+func proxyStream(c *gin.Context) {
+	targetURL := c.Query("url")
+	if targetURL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url parameter is required"})
+		return
+	}
+
+	target, err := url.Parse(targetURL)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid target URL"})
+		return
+	}
+
+	customReferer := c.Query("referer")
+	customOrigin := c.Query("origin")
+
+	// Playlists are handled manually.
+	// Everything else goes through ReverseProxy.
+	if isM3U8URL(target) {
+		proxyM3U8(c, target, customReferer, customOrigin)
+		return
+	}
+
+	proxy := newStreamReverseProxy(target, customReferer, customOrigin)
+	proxy.ServeHTTP(c.Writer, c.Request)
+}
+
+func isM3U8URL(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(u.Path), ".m3u8")
+}
+
+func proxyM3U8(c *gin.Context, target *url.URL, customReferer, customOrigin string) {
+	start := time.Now()
+
+	reqBuilder := client.R()
+
+	if customReferer != "" {
+		reqBuilder.SetHeader("Referer", customReferer)
+	}
+	if customOrigin != "" {
+		reqBuilder.SetHeader("Origin", customOrigin)
+	} else {
+		reqBuilder.SetHeader("Origin", "https://www.miruro.tv")
+	}
+
+	resp, err := reqBuilder.Get(target.String())
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch M3U8: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	if !resp.IsSuccessState() {
+		c.JSON(resp.GetStatusCode(), gin.H{
+			"error": fmt.Sprintf("upstream M3U8 returned %d", resp.GetStatusCode()),
+		})
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read M3U8: " + err.Error()})
+		return
+	}
+
+	manifest := string(body)
+
+	// Only rewrite codecs for normal audio/video HLS.
+	// Do not touch image-segment playlists like your .jpg manifests.
+	if !isImageSegmentPlaylist(manifest) {
+		manifest = strings.ReplaceAll(manifest, "mp4a.40.1", "mp4a.40.2")
+		manifest = strings.ReplaceAll(manifest, "mp4a.40.34", "mp4a.40.2")
+	} else {
+		log.Printf("[M3U8] image playlist detected; codec rewrite disabled: %s (%v)", target.String(), time.Since(start))
+	}
+
+	rewritten := rewriteM3U8Manifest(manifest, target, customReferer, customOrigin)
+
+	c.Header("Content-Type", "application/vnd.apple.mpegurl")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Content-Length", strconv.Itoa(len(rewritten)))
+
+	log.Printf("[M3U8] %s | %d bytes | %v", target.String(), len(rewritten), time.Since(start))
+
+	c.Status(http.StatusOK)
+	if _, err := c.Writer.Write([]byte(rewritten)); err != nil {
+		log.Printf("[M3U8] write error: %v", err)
+	}
+}
+
+func isImageSegmentPlaylist(manifest string) bool {
+	for _, line := range strings.Split(manifest, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			continue
+		}
+
+		p := strings.ToLower(u.Path)
+		if strings.HasSuffix(p, ".jpg") ||
+			strings.HasSuffix(p, ".jpeg") ||
+			strings.HasSuffix(p, ".png") ||
+			strings.HasSuffix(p, ".webp") {
+			return true
+		}
+	}
+	return false
+}
+
+func rewriteM3U8Manifest(manifest string, finalURL *url.URL, customReferer, customOrigin string) string {
+	uriRegex := regexp.MustCompile(`URI=["']?([^"'\s>]+)["']?`)
+	lines := strings.Split(manifest, "\n")
+	out := make([]string, 0, len(lines))
+
+	proxify := func(raw string) string {
+		if raw == "" || strings.HasPrefix(raw, "data:") {
+			return raw
+		}
+
+		absoluteURL := raw
+		if parsed, err := url.Parse(raw); err == nil {
+			absoluteURL = finalURL.ResolveReference(parsed).String()
+		}
+
+		proxied := "/proxy/stream?url=" + url.QueryEscape(absoluteURL)
+		if customReferer != "" {
+			proxied += "&referer=" + url.QueryEscape(customReferer)
+		}
+		if customOrigin != "" {
+			proxied += "&origin=" + url.QueryEscape(customOrigin)
+		}
+		return proxied
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "" {
+			out = append(out, line)
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "#") {
+			if strings.Contains(trimmed, "URI=") {
+				rewritten := uriRegex.ReplaceAllStringFunc(trimmed, func(match string) string {
+					m := uriRegex.FindStringSubmatch(match)
+					if len(m) < 2 {
+						return match
+					}
+					return `URI="` + proxify(m[1]) + `"`
+				})
+				out = append(out, rewritten)
+			} else {
+				out = append(out, line)
+			}
+			continue
+		}
+
+		out = append(out, proxify(trimmed))
+	}
+
+	return strings.Join(out, "\n")
+}
+
+func newStreamReverseProxy(target *url.URL, customReferer, customOrigin string) *httputil.ReverseProxy {
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.URL.Path = target.Path
+			req.URL.RawPath = target.RawPath
+			req.URL.RawQuery = target.RawQuery
+			req.Host = target.Host
+
+			if customReferer != "" {
+				req.Header.Set("Referer", customReferer)
+			}
+			if customOrigin != "" {
+				req.Header.Set("Origin", customOrigin)
+			} else {
+				req.Header.Set("Origin", "https://www.miruro.tv")
+			}
+
+			req.Header.Set(
+				"User-Agent",
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+			)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			log.Printf(
+				"[SEGMENT] status=%d range=%q type=%s length=%s content-range=%s url=%s",
+				resp.StatusCode,
+				resp.Request.Header.Get("Range"),
+				resp.Header.Get("Content-Type"),
+				resp.Header.Get("Content-Length"),
+				resp.Header.Get("Content-Range"),
+				resp.Request.URL.String(),
+			)
+
+			resp.Header.Set("Access-Control-Allow-Origin", "*")
+			resp.Header.Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type")
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("[SEGMENT] reverse proxy error: %v", err)
+			http.Error(w, "stream proxy error", http.StatusBadGateway)
+		},
+	}
+
+	return proxy
+}
+
 func home(c *gin.Context) {
-	// (Note: The JS string interpolation has been replaced with concat to prevent backtick clash in Go)
 	htmlContent := `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Miruro API v3.0</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-:root{
-  --bg:#03040a;--surface:rgba(255,255,255,0.03);--border:rgba(255,255,255,0.07);
-  --blue:#38bdf8;--purple:#818cf8;--green:#34d399;--amber:#fbbf24;
-  --text:#e2e8f0;--muted:#64748b;--dim:#334155;
-  --font:'Inter',sans-serif;--mono:'JetBrains Mono',monospace;
-}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}
-#bg{position:fixed;inset:0;z-index:0;pointer-events:none}
-.notice{position:relative;z-index:10;background:linear-gradient(90deg,rgba(251,191,36,.12),rgba(251,191,36,.06));border-bottom:1px solid rgba(251,191,36,.2);padding:11px 20px;text-align:center;font-size:.82em;color:#fde68a;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
-.notice strong{color:#fbbf24}
-.notice-icon{font-size:1em;flex-shrink:0}
-.wrap{position:relative;z-index:1;max-width:860px;margin:0 auto;padding:60px 20px 80px}
-.hero{text-align:center;padding:50px 0 60px;perspective:1000px}
-.logo-wrap{display:inline-block;margin-bottom:28px;animation:float 6s ease-in-out infinite}
-.logo-wrap img{width:88px;border-radius:22px;box-shadow:0 0 0 1px var(--border),0 20px 60px rgba(56,189,248,.2);display:block}
-@keyframes float{0%,100%{transform:translateY(0) rotateY(0deg)}50%{transform:translateY(-8px) rotateY(6deg)}}
-h1{font-size:clamp(2rem,6vw,3.2rem);font-weight:700;letter-spacing:-.03em;line-height:1.1;margin-bottom:14px}
-.grad{background:linear-gradient(135deg,#fff 0%,var(--blue) 50%,var(--purple) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.sub{color:var(--muted);font-size:1em;font-weight:400;max-width:480px;margin:0 auto 20px;line-height:1.6}
-.chip{display:inline-flex;align-items:center;gap:6px;background:rgba(56,189,248,.08);color:var(--blue);border:1px solid rgba(56,189,248,.18);border-radius:999px;padding:5px 14px;font-size:.78em;font-weight:500;letter-spacing:.04em}
-.chip::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
-.section{margin-top:56px}
-.section-head{display:flex;align-items:center;gap:10px;margin-bottom:20px}
-.section-head h2{font-size:.7em;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
-.section-line{flex:1;height:1px;background:var(--border)}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 24px;margin-bottom:10px;cursor:default;will-change:transform;transition:transform .2s cubic-bezier(.23,1,.32,1),box-shadow .2s cubic-bezier(.23,1,.32,1),border-color .2s;transform-style:preserve-3d}
-.card:hover{transform:translateY(-3px) scale(1.005);box-shadow:0 20px 60px rgba(0,0,0,.5),0 0 0 1px rgba(56,189,248,.12);border-color:rgba(56,189,248,.18)}
-.card-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.method{font-family:var(--mono);font-size:.72em;font-weight:500;background:rgba(52,211,153,.1);color:var(--green);border:1px solid rgba(52,211,153,.2);padding:3px 9px;border-radius:6px;letter-spacing:.04em}
-.path{font-family:var(--mono);font-size:.92em;color:var(--text);font-weight:500}
-.badge{font-size:.65em;padding:2px 7px;border-radius:5px;font-weight:600;letter-spacing:.05em}
-.b-new{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.25)}
-.b-hot{background:rgba(251,191,36,.1);color:var(--amber);border:1px solid rgba(251,191,36,.2)}
-.b-rec{background:rgba(129,140,248,.12);color:var(--purple);border:1px solid rgba(129,140,248,.25)}
-.desc{color:var(--muted);font-size:.87em;line-height:1.65;margin-top:12px}
-.desc b{color:var(--text);font-weight:500}
-.params{font-family:var(--mono);font-size:.78em;color:var(--dim);margin-top:10px;line-height:1.9}
-.params em{color:var(--blue);font-style:normal}
-.try{display:inline-flex;align-items:center;gap:5px;margin-top:12px;font-size:.8em;color:var(--blue);text-decoration:none;border:1px solid rgba(56,189,248,.15);border-radius:7px;padding:4px 10px;transition:background .15s,border-color .15s}
-.try:hover{background:rgba(56,189,248,.08);border-color:rgba(56,189,248,.3)}
-.try::after{content:'↗';font-size:.9em}
-.returns{font-size:.8em;color:var(--dim);margin-top:10px;line-height:1.7}
-.returns b{color:#a5b4fc;font-weight:500}
-.step-card{border-radius:14px;padding:22px 24px;margin-bottom:10px;border:1px solid var(--border);will-change:transform;transition:transform .2s cubic-bezier(.23,1,.32,1),box-shadow .2s}
-.step-card:hover{transform:translateY(-3px);box-shadow:0 20px 60px rgba(0,0,0,.5)}
-.step1{background:linear-gradient(135deg,rgba(56,189,248,.05),rgba(56,189,248,.02))}
-.step2{background:linear-gradient(135deg,rgba(52,211,153,.05),rgba(52,211,153,.02));border-color:rgba(52,211,153,.15)}
-.step3{background:linear-gradient(135deg,rgba(129,140,248,.05),rgba(129,140,248,.02));border-color:rgba(129,140,248,.15)}
-.step-num{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;font-size:.78em;font-weight:700;margin-right:8px;flex-shrink:0}
-.s1{background:rgba(56,189,248,.12);color:var(--blue);border:1px solid rgba(56,189,248,.25)}
-.s2{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.25)}
-.s3{background:rgba(129,140,248,.12);color:var(--purple);border:1px solid rgba(129,140,248,.25)}
-pre{background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:10px;padding:16px;font-family:var(--mono);font-size:.76em;color:#94a3b8;overflow-x:auto;margin-top:14px;line-height:1.7;tab-size:2}
-code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,180,252,.07);padding:1px 5px;border-radius:4px}
-.ptable{width:100%;margin-top:14px;border-collapse:collapse;font-size:.8em}
-.ptable th{text-align:left;color:var(--purple);font-weight:500;padding:7px 10px;border-bottom:1px solid var(--border);font-size:.9em}
-.ptable td{padding:7px 10px;color:var(--muted);border-bottom:1px solid rgba(255,255,255,.025)}
-.ptable td:first-child{font-family:var(--mono);color:#a5b4fc;white-space:nowrap}
-.alert{border-radius:10px;padding:13px 16px;font-size:.83em;line-height:1.6;margin-top:14px}
-.alert-yellow{background:rgba(251,191,36,.06);border:1px solid rgba(251,191,36,.15);color:#fde68a}
-.alert-yellow b{color:var(--amber)}
-.alert-green{background:rgba(52,211,153,.06);border:1px solid rgba(52,211,153,.15);color:#6ee7b7}
-.alert-green b{color:var(--green)}
-.footer{text-align:center;margin-top:72px;padding-top:28px;border-top:1px solid var(--border);color:var(--dim);font-size:.82em;line-height:2}
-.footer a{color:var(--blue);text-decoration:none;font-weight:500}
-.footer a:hover{color:var(--purple)}
-@media(max-width:600px){
-  .wrap{padding:40px 14px 60px}
-  .hero{padding:36px 0 44px}
-  .card,.step-card{padding:18px}
-  pre{font-size:.7em}
-}
-</style>
 </head>
 <body>
-<canvas id="bg"></canvas>
-<div class="notice">
-  <span class="notice-icon">⚠️</span>
-  <span><strong>Hosting Notice:</strong> Miruro now has Cloudflare protection on the pipe endpoint. <strong>Do not deploy on Vercel</strong> — its IPs are datacenter-blocked by CF. Use a <strong>VPS with a residential or non-datacenter IP</strong> instead.</span>
-</div>
-<div class="wrap">
-  <div class="hero">
-    <div class="logo-wrap">
-      <img src="https://www.miruro.to/assets/logo-Dnw3w3dS.png?v=1.12.0" alt="Miruro">
-    </div>
-    <h1><span class="grad">Miruro API</span></h1>
-    <p class="sub">Reverse-engineered anime streaming API. Episodes, sources, metadata — all in one place.</p>
-    <div class="chip">v3.0 &nbsp;·&nbsp; Live</div>
-  </div>
-  <div class="section">
-    <div class="section-head"><h2>Search &amp; Discovery</h2><div class="section-line"></div></div>
-    <div class="card">
-      <div class="card-top"><span class="method">GET</span><span class="path">/search</span></div>
-      <p class="desc">Search anime by name. Returns full metadata — title, cover, banner, genres, studios, scores, airing status, and more.</p>
-      <div class="params">Params: <em>query</em> (required) &nbsp;·&nbsp; <em>page</em>=1 &nbsp;·&nbsp; <em>per_page</em>=20</div>
-      <div class="returns">Returns: <b>page</b>, <b>perPage</b>, <b>total</b>, <b>hasNextPage</b>, <b>results[]</b> (20+ fields each)</div>
-      <a class="try" href="/search?query=naruto&page=1&per_page=5" target="_blank">Try it</a>
-    </div>
-  </div>
-  <div class="footer">
-    All collection endpoints return <code>{ page, perPage, total, hasNextPage, results[] }</code>
-    <br>
-    Built by Walter &nbsp;·&nbsp; <a href="https://github.com/walterwhite-69" target="_blank">github.com/walterwhite-69</a>
-  </div>
-</div>
-<script>
-(function(){
-  const c=document.getElementById('bg'),x=c.getContext('2d');
-  let W,H,pts=[];
-  const N=60,COLOR='rgba(56,189,248,';
-  function resize(){W=c.width=innerWidth;H=c.height=innerHeight;pts=Array.from({length:N},()=>({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-.5)*.3,vy:(Math.random()-.5)*.3,r:Math.random()*1.5+.5}))}
-  function draw(){
-    x.clearRect(0,0,W,H);
-    for(let i=0;i<N;i++){
-      const p=pts[i];
-      p.x+=p.vx;p.y+=p.vy;
-      if(p.x<0||p.x>W)p.vx*=-1;
-      if(p.y<0||p.y>H)p.vy*=-1;
-      x.beginPath();x.arc(p.x,p.y,p.r,0,6.28);x.fillStyle=COLOR+'.4)';x.fill();
-      for(let j=i+1;j<N;j++){
-        const q=pts[j],dx=p.x-q.x,dy=p.y-q.y,d=Math.sqrt(dx*dx+dy*dy);
-        if(d<140){x.beginPath();x.moveTo(p.x,p.y);x.lineTo(q.x,q.y);x.strokeStyle=COLOR+(1-d/140)*.08+')';x.lineWidth=.6;x.stroke()}
-      }
-    }
-    requestAnimationFrame(draw);
-  }
-  window.addEventListener('resize',resize);resize();draw();
-
-  document.querySelectorAll('.card,.step-card').forEach(el=>{
-    el.addEventListener('mousemove',e=>{
-      const r=el.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2;
-      const rx=((e.clientY-cy)/r.height)*6,ry=-((e.clientX-cx)/r.width)*6;
-      el.style.transform="perspective(800px) rotateX(" + rx + "deg) rotateY(" + ry + "deg) translateY(-3px)";
-    });
-    el.addEventListener('mouseleave',()=>el.style.transform='');
-  });
-})();
-</script>
+<h1>Miruro API v3.0 Live</h1>
 </body>
 </html>`
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(htmlContent))
@@ -661,7 +743,7 @@ func searchSuggestions(c *gin.Context) {
 			title = titleMap["romaji"]
 		}
 
-		year := (*new(int))
+		year := 0
 		if sd, ok := item["startDate"].(map[string]any); ok && sd["year"] != nil {
 			year = int(sd["year"].(float64))
 		}
@@ -1075,9 +1157,9 @@ func getSourcesRoute(c *gin.Context) {
 	}
 
 	encodedReq := encodePipeRequest(payload)
-	url := fmt.Sprintf("%s?e=%s", MiruroPipeUrl, encodedReq)
+	urlStr := fmt.Sprintf("%s?e=%s", MiruroPipeUrl, encodedReq)
 	
-	resp, err := client.R().Get(url)
+	resp, err := client.R().Get(urlStr)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1139,7 +1221,6 @@ func getWatchSources(c *gin.Context) {
 		return
 	}
 
-	// Redirect internally to getSources logic
 	c.Request.URL.RawQuery = fmt.Sprintf("episodeId=%s&provider=%s&anilistId=%d&category=%s", targetID, provider, anilistID, category)
 	getSourcesRoute(c)
 }
